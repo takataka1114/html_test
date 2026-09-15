@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>Reactive Instrument</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 760px;
+      margin: 40px auto;
+      line-height: 1.6;
+    }
+    button, input {
+      font-size: 1rem;
+      margin: 8px 0;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Reactive Instrument</h1>
+
+<p>
+マイク入力のアタックを検出して、
+電子音が「返事」をする簡易システム。
+</p>
+
+<button id="start">START</button>
+
+<div>
+  <label>
+    感度
+    <input id="threshold" type="range"
+           min="0.01" max="0.30" step="0.01" value="0.08">
+  </label>
+</div>
+
+<div>
+  <label>
+    反応量
+    <input id="response" type="range"
+           min="0" max="1" step="0.01" value="0.6">
+  </label>
+</div>
+
+<p id="status">停止中</p>
+
+<script>
+let ctx;
+let analyser;
+let data;
+let previousLevel = 0;
+let lastTrigger = 0;
+
+const startButton = document.getElementById("start");
+const thresholdSlider = document.getElementById("threshold");
+const responseSlider = document.getElementById("response");
+const status = document.getElementById("status");
+
+startButton.onclick = async () => {
+
+  ctx = new AudioContext();
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: true
+  });
+
+  const mic = ctx.createMediaStreamSource(stream);
+
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;
+
+  data = new Float32Array(analyser.fftSize);
+
+  mic.connect(analyser);
+
+  status.textContent = "Listening...";
+
+  detect();
+};
+
+
+function detect() {
+
+  analyser.getFloatTimeDomainData(data);
+
+  let sum = 0;
+
+  for (let i = 0; i < data.length; i++) {
+    sum += data[i] * data[i];
+  }
+
+  const rms = Math.sqrt(sum / data.length);
+
+  const threshold =
+    parseFloat(thresholdSlider.value);
+
+  const attack =
+    rms - previousLevel;
+
+  const now = ctx.currentTime;
+
+
+  // 急激な音量上昇＝アタックと判断
+  if (
+    rms > threshold &&
+    attack > 0.025 &&
+    now - lastTrigger > 0.18
+  ) {
+
+    respond(rms);
+
+    lastTrigger = now;
+  }
+
+  previousLevel =
+    previousLevel * 0.85 +
+    rms * 0.15;
+
+  requestAnimationFrame(detect);
+}
+
+
+
+function respond(energy) {
+
+  const amount =
+    parseFloat(responseSlider.value);
+
+  // ----------------------
+  // 1. 発振器
+  // ----------------------
+
+  const osc = ctx.createOscillator();
+
+  // 入力強度に応じて周波数が変化
+  const base =
+    160 +
+    energy * 1800;
+
+  osc.frequency.value = base;
+
+  osc.type = "sine";
+
+
+  // ----------------------
+  // 2. 金属的な変調
+  // ----------------------
+
+  const mod = ctx.createOscillator();
+  const modGain = ctx.createGain();
+
+  mod.frequency.value =
+    30 +
+    Math.random() * 220;
+
+  modGain.gain.value =
+    40 +
+    energy * 800;
+
+  mod.connect(modGain);
+  modGain.connect(osc.frequency);
+
+
+  // ----------------------
+  // 3. フィルター
+  // ----------------------
+
+  const filter =
+    ctx.createBiquadFilter();
+
+  filter.type = "bandpass";
+
+  filter.frequency.value =
+    base * (1 + Math.random() * 2);
+
+  filter.Q.value =
+    3 + Math.random() * 12;
+
+
+  // ----------------------
+  // 4. 空間移動
+  // ----------------------
+
+  const pan =
+    ctx.createStereoPanner();
+
+  pan.pan.value =
+    Math.random() * 2 - 1;
+
+
+  // ----------------------
+  // 5. 音量エンベロープ
+  // ----------------------
+
+  const gain =
+    ctx.createGain();
+
+  const t =
+    ctx.currentTime;
+
+  gain.gain.setValueAtTime(0, t);
+
+  gain.gain.linearRampToValueAtTime(
+    Math.min(0.5, energy * 3 * amount),
+    t + 0.02
+  );
+
+  gain.gain.exponentialRampToValueAtTime(
+    0.001,
+    t + 0.5 + Math.random() * 2
+  );
+
+
+  osc.connect(filter);
+  filter.connect(pan);
+  pan.connect(gain);
+  gain.connect(ctx.destination);
+
+
+  osc.start(t);
+  mod.start(t);
+
+  osc.stop(t + 3);
+  mod.stop(t + 3);
+
+
+  // ----------------------
+  // ときどき第二の反応
+  // ----------------------
+
+  if (Math.random() < 0.35) {
+
+    setTimeout(() => {
+
+      echoResponse(
+        base *
+        (0.5 + Math.random() * 1.5),
+        amount
+      );
+
+    },
+    120 + Math.random() * 900);
+
+  }
+}
+
+
+
+function echoResponse(freq, amount) {
+
+  const osc =
+    ctx.createOscillator();
+
+  const gain =
+    ctx.createGain();
+
+  const pan =
+    ctx.createStereoPanner();
+
+  osc.type =
+    Math.random() < 0.5
+      ? "triangle"
+      : "sine";
+
+  osc.frequency.value =
+    freq;
+
+  pan.pan.value =
+    Math.random() * 2 - 1;
+
+  const t =
+    ctx.currentTime;
+
+  gain.gain.setValueAtTime(
+    0.18 * amount,
+    t
+  );
+
+  gain.gain.exponentialRampToValueAtTime(
+    0.001,
+    t + 1.5
+  );
+
+  osc.connect(pan);
+  pan.connect(gain);
+  gain.connect(ctx.destination);
+
+  osc.start(t);
+  osc.stop(t + 1.6);
+}
+</script>
+
+</body>
+</html>
