@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Phase Memory Accompaniment Prototype</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      background: #111;
+      color: #eee;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 { margin-top: 0; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .panel {
+      background: #1b1b1b;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    button, select {
+      font: inherit;
+      padding: 8px 12px;
+      margin: 4px 4px 4px 0;
+    }
+    .big {
+      font-size: 1.4rem;
+      font-weight: 700;
+    }
+    .muted { color: #aaa; }
+    .kbd {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .key {
+      min-width: 48px;
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0b0b0b;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 260px;
+      overflow: auto;
+    }
+    code { color: #d8d8d8; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Phase Memory Accompaniment Prototype</h1>
+  <p class="muted">
+    MIDI入力を記録し、規定モチーフの反復で次フェーズへ移行。
+    直前までの演奏を変形して背景レイヤーとして再利用します。
+  </p>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Transport</h2>
+      <button id="startBtn">Audio / MIDI 開始</button>
+      <button id="resetBtn">リセット</button>
+      <div>
+        <label>MIDI入力:
+          <select id="midiSelect">
+            <option value="">未選択</option>
+          </select>
+        </label>
+      </div>
+      <p id="status" class="muted">停止中</p>
+    </section>
+
+    <section class="panel">
+      <h2>現在の状態</h2>
+      <div class="big" id="phaseLabel">PHASE A</div>
+      <div id="motifLabel"></div>
+      <div id="countLabel"></div>
+      <div id="captureLabel"></div>
+      <div id="memoryLabel"></div>
+    </section>
+
+    <section class="panel">
+      <h2>テスト用キーボード</h2>
+      <p class="muted">PCキーでも鳴らせます。A=C4 / W=C#4 ...</p>
+      <div id="kbd" class="kbd"></div>
+    </section>
+  </div>
+
+  <section class="panel" style="margin-top:16px">
+    <h2>ログ</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <section class="panel" style="margin-top:16px">
+    <h2>編集する場所</h2>
+    <p>
+      JavaScript内の <code>PHASES</code> を変更すると、各フェーズのモチーフと必要回数を変えられます。
+      <code>makeTransformForNewLayer()</code> で背景変形規則を変えられます。
+    </p>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  // ============================================================
+  // 1. 作曲ルール
+  // ============================================================
+
+  const PHASES = [
+    {
+      name: "A",
+      motif: [60, 62, 65, 64],   // C4 D4 F4 E4
+      required: 3
+    },
+    {
+      name: "B",
+      motif: [67, 68, 69],       // G4 Ab4 A4
+      required: 4
+    },
+    {
+      name: "C",
+      motif: [72, 72, 72, 72],   // C5 x 4
+      required: 2
+    }
+  ];
+
+  // 古い記憶ほど薄くする
+  const MEMORY_GAINS = [0.80, 0.40, 0.15];
+
+  // ============================================================
+  // 2. 状態
+  // ============================================================
+
+  let audioCtx = null;
+  let masterGain = null;
+  let midiAccess = null;
+  let selectedMidiInput = null;
+
+  let phaseIndex = 0;
+  let motifCount = 0;
+  let noteBuffer = [];
+
+  let phaseStartTime = 0;
+  let capturedNotes = [];
+  let activeNotes = new Map();
+
+  // memoryLayers[0] = 直前フェーズ
+  let memoryLayers = [];
+
+  let running = false;
+
+  // ============================================================
+  // 3. DOM
+  // ============================================================
+
+  const startBtn = document.getElementById("startBtn");
+  const resetBtn = document.getElementById("resetBtn");
+  const midiSelect = document.getElementById("midiSelect");
+
+  const statusEl = document.getElementById("status");
+  const phaseLabel = document.getElementById("phaseLabel");
+  const motifLabel = document.getElementById("motifLabel");
+  const countLabel = document.getElementById("countLabel");
+  const captureLabel = document.getElementById("captureLabel");
+  const memoryLabel = document.getElementById("memoryLabel");
+  const logEl = document.getElementById("log");
+  const kbdEl = document.getElementById("kbd");
+
+  function log(msg) {
+    const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.textContent = line + "\n" + logEl.textContent;
+  }
+
+  function currentPhase() {
+    return PHASES[Math.min(phaseIndex, PHASES.length - 1)];
+  }
+
+  function updateUI() {
+    const p = currentPhase();
+    phaseLabel.textContent =
+      phaseIndex < PHASES.length ? `PHASE ${p.name}` : "END";
+
+    motifLabel.textContent =
+      phaseIndex < PHASES.length
+        ? `監視モチーフ: [${p.motif.join(", ")}]`
+        : "監視終了";
+
+    countLabel.textContent =
+      phaseIndex < PHASES.length
+        ? `検出: ${motifCount} / ${p.required}`
+        : "";
+
+    captureLabel.textContent =
+      `現在フェーズの収集ノート数: ${capturedNotes.length}`;
+
+    memoryLabel.textContent =
+      `背景レイヤー数: ${memoryLayers.length}`;
+  }
+
+  // ============================================================
+  // 4. Audio
+  // ============================================================
+
+  async function ensureAudio() {
+    if (!audioCtx) {
+      audioCtx = new AudioContext();
+
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.65;
+      masterGain.connect(audioCtx.destination);
+    }
+
+    if (audioCtx.state === "suspended") {
+      await audioCtx.resume();
+    }
+  }
+
+  function midiToFreq(note) {
+    return 440 * Math.pow(2, (note - 69) / 12);
+  }
+
+  function synthNote(note, velocity, when, duration, volume = 1, timbre = "triangle") {
+    if (!audioCtx || !masterGain) return;
+
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+
+    const safeDuration = Math.max(0.04, duration);
+    const attack = 0.008;
+    const release = Math.min(0.12, safeDuration * 0.4);
+
+    osc.type = timbre;
+    osc.frequency.setValueAtTime(midiToFreq(note), when);
+
+    const amp = Math.max(0.0001, (velocity / 127) * volume * 0.22);
+
+    gain.gain.setValueAtTime(0.0001, when);
+    gain.gain.linearRampToValueAtTime(amp, when + attack);
+    gain.gain.setValueAtTime(amp, Math.max(when + attack, when + safeDuration - release));
+    gain.gain.exponentialRampToValueAtTime(0.0001, when + safeDuration);
+
+    osc.connect(gain);
+    gain.connect(masterGain);
+
+    osc.start(when);
+    osc.stop(when + safeDuration + 0.03);
+  }
+
+  // ============================================================
+  // 5. MIDI入力
+  // ============================================================
+
+  async function initMidi() {
+    if (!navigator.requestMIDIAccess) {
+      statusEl.textContent = "このブラウザは Web MIDI API 非対応";
+      log("Web MIDI API 非対応。PCキーボードでテストできます。");
+      return;
+    }
+
+    try {
+      midiAccess = await navigator.requestMIDIAccess();
+      refreshMidiInputs();
+
+      midiAccess.onstatechange = () => refreshMidiInputs();
+      log("MIDIアクセス取得成功");
+    } catch (err) {
+      log("MIDIアクセス失敗: " + err.message);
+    }
+  }
+
+  function refreshMidiInputs() {
+    if (!midiAccess) return;
+
+    const oldValue = midiSelect.value;
+    midiSelect.innerHTML = '<option value="">未選択</option>';
+
+    for (const input of midiAccess.inputs.values()) {
+      const option = document.createElement("option");
+      option.value = input.id;
+      option.textContent = input.name || input.manufacturer || input.id;
+      midiSelect.appendChild(option);
+    }
+
+    if ([...midiSelect.options].some(o => o.value === oldValue)) {
+      midiSelect.value = oldValue;
+    }
+  }
+
+  function selectMidiInput(id) {
+    if (selectedMidiInput) {
+      selectedMidiInput.onmidimessage = null;
+      selectedMidiInput = null;
+    }
+
+    if (!id || !midiAccess) return;
+
+    selectedMidiInput = midiAccess.inputs.get(id);
+    if (!selectedMidiInput) return;
+
+    selectedMidiInput.onmidimessage = handleMidiMessage;
+    log("MIDI入力選択: " + (selectedMidiInput.name || id));
+  }
+
+  function handleMidiMessage(event) {
+    const [status, data1, data2] = event.data;
+    const command = status & 0xF0;
+    const note = data1;
+    const velocity = data2 || 0;
+
+    if (command === 0x90 && velocity > 0) {
+      handleNoteOn(note, velocity, "midi");
+    } else if (command === 0x80 || (command === 0x90 && velocity === 0)) {
+      handleNoteOff(note, "midi");
+    }
+  }
+
+  // ============================================================
+  // 6. 演奏記録
+  // ============================================================
+
+  function handleNoteOn(note, velocity = 96, source = "unknown") {
+    if (!running || !audioCtx) return;
+    if (phaseIndex >= PHASES.length) return;
+
+    const now = audioCtx.currentTime;
+    const rel = now - phaseStartTime;
+
+    // 同音連打で前のNoteOffが来ていない場合は短く閉じる
+    if (activeNotes.has(note)) {
+      closeCapturedNote(note, now);
+    }
+
+    activeNotes.set(note, {
+      pitch: note,
+      velocity,
+      startAbs: now,
+      start: rel,
+      source
+    });
+
+    // 入力音のモニター
+    synthNote(note, velocity, now, 0.16, 0.70, "sine");
+
+    processMotif(note);
+  }
+
+  function handleNoteOff(note) {
+    if (!running || !audioCtx) return;
+    closeCapturedNote(note, audioCtx.currentTime);
+  }
+
+  function closeCapturedNote(note, nowAbs) {
+    const n = activeNotes.get(note);
+    if (!n) return;
+
+    const duration = Math.max(0.04, nowAbs - n.startAbs);
+
+    capturedNotes.push({
+      pitch: n.pitch,
+      velocity: n.velocity,
+      start: n.start,
+      duration,
+      source: n.source
+    });
+
+    activeNotes.delete(note);
+    updateUI();
+  }
+
+  function flushActiveNotes() {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    for (const note of [...activeNotes.keys()]) {
+      closeCapturedNote(note, now);
+    }
+  }
+
+  // ============================================================
+  // 7. モチーフ認識
+  // ============================================================
+
+  function arraysEqual(a, b) {
+    return a.length === b.length && a.every((v, i) => v === b[i]);
+  }
+
+  function processMotif(note) {
+    const phase = currentPhase();
+    const motif = phase.motif;
+
+    noteBuffer.push(note);
+
+    while (noteBuffer.length > motif.length) {
+      noteBuffer.shift();
+    }
+
+    if (arraysEqual(noteBuffer, motif)) {
+      motifCount++;
+      log(`PHASE ${phase.name}: motif detected ${motifCount}/${phase.required}`);
+
+      // 同じ4音列の末尾が次の検出に重なりすぎないよう一旦クリア
+      noteBuffer = [];
+
+      updateUI();
+
+      if (motifCount >= phase.required) {
+        advancePhase();
+      }
+    }
+  }
+
+  // ============================================================
+  // 8. フェーズ移行
+  // ============================================================
+
+  function advancePhase() {
+    flushActiveNotes();
+
+    const oldPhase = currentPhase();
+    const frozen = capturedNotes.map(n => ({ ...n }));
+
+    log(`PHASE ${oldPhase.name} 終了: ${frozen.length} notes captured`);
+
+    if (frozen.length > 0) {
+      const transform = makeTransformForNewLayer(memoryLayers.length);
+      const layer = createMemoryLayer(frozen, transform);
+      memoryLayers.unshift(layer);
+
+      // 3世代だけ保持
+      if (memoryLayers.length > MEMORY_GAINS.length) {
+        const removed = memoryLayers.pop();
+        stopLayer(removed);
+      }
+
+      // 世代ごとの音量を更新
+      memoryLayers.forEach((layerObj, i) => {
+        layerObj.volume = MEMORY_GAINS[i];
+      });
+
+      startLayer(layer);
+    }
+
+    phaseIndex++;
+    motifCount = 0;
+    noteBuffer = [];
+    capturedNotes = [];
+    activeNotes.clear();
+
+    if (phaseIndex >= PHASES.length) {
+      running = false;
+      statusEl.textContent = "全フェーズ終了";
+      log("END");
+      updateUI();
+      return;
+    }
+
+    phaseStartTime = audioCtx.currentTime;
+    statusEl.textContent = `実行中: PHASE ${currentPhase().name}`;
+    log(`→ PHASE ${currentPhase().name}`);
+    updateUI();
+  }
+
+  // ============================================================
+  // 9. 記憶の変形
+  // ============================================================
+
+  function makeTransformForNewLayer(generation) {
+    // generation 0 = 最初に作られた記憶
+    // 必要ならここをフェーズごとに自由に作り替える。
+    const presets = [
+      {
+        transpose: -12,
+        timeScale: 4.0,
+        density: 0.65,
+        durationScale: 2.2,
+        velocityScale: 0.60,
+        timbre: "triangle"
+      },
+      {
+        transpose: 7,
+        timeScale: 2.0,
+        density: 0.48,
+        durationScale: 0.75,
+        velocityScale: 0.48,
+        timbre: "sine"
+      },
+      {
+        transpose: -24,
+        timeScale: 6.0,
+        density: 0.35,
+        durationScale: 3.5,
+        velocityScale: 0.42,
+        timbre: "sine"
+      }
+    ];
+
+    return presets[generation % presets.length];
+  }
+
+  function createMemoryLayer(notes, transform) {
+    const kept = notes.filter(() => Math.random() <= transform.density);
+
+    let transformed = kept.map(n => ({
+      pitch: clampMidi(n.pitch + transform.transpose),
+      velocity: Math.max(1, Math.round(n.velocity * transform.velocityScale)),
+      start: n.start * transform.timeScale,
+      duration: Math.max(0.05, n.duration * transform.durationScale)
+    }));
+
+    // 全部間引かれた場合は最低1音残す
+    if (transformed.length === 0 && notes.length > 0) {
+      const n = notes[0];
+      transformed = [{
+        pitch: clampMidi(n.pitch + transform.transpose),
+        velocity: Math.max(1, Math.round(n.velocity * transform.velocityScale)),
+        start: n.start * transform.timeScale,
+        duration: Math.max(0.05, n.duration * transform.durationScale)
+      }];
+    }
+
+    const endTime = transformed.reduce(
+      (max, n) => Math.max(max, n.start + n.duration),
+      0
+    );
+
+    return {
+      notes: transformed,
+      timbre: transform.timbre,
+      volume: 0.8,
+      loopLength: Math.max(1.0, endTime + 0.5),
+      timer: null,
+      stopped: false
+    };
+  }
+
+  function clampMidi(n) {
+    return Math.max(0, Math.min(127, n));
+  }
+
+  // ============================================================
+  // 10. 背景レイヤーのループ再生
+  // ============================================================
+
+  function startLayer(layer) {
+    layer.stopped = false;
+
+    const playLoop = () => {
+      if (layer.stopped || !audioCtx) return;
+
+      const startAt = audioCtx.currentTime + 0.05;
+
+      for (const n of layer.notes) {
+        synthNote(
+          n.pitch,
+          n.velocity,
+          startAt + n.start,
+          n.duration,
+          layer.volume,
+          layer.timbre
+        );
+      }
+
+      layer.timer = setTimeout(
+        playLoop,
+        Math.max(100, layer.loopLength * 1000)
+      );
+    };
+
+    playLoop();
+  }
+
+  function stopLayer(layer) {
+    if (!layer) return;
+    layer.stopped = true;
+    if (layer.timer) {
+      clearTimeout(layer.timer);
+      layer.timer = null;
+    }
+  }
+
+  function stopAllLayers() {
+    memoryLayers.forEach(stopLayer);
+    memoryLayers = [];
+  }
+
+  // ============================================================
+  // 11. リセット
+  // ============================================================
+
+  function resetSystem() {
+    stopAllLayers();
+
+    phaseIndex = 0;
+    motifCount = 0;
+    noteBuffer = [];
+    capturedNotes = [];
+    activeNotes.clear();
+
+    if (audioCtx) {
+      phaseStartTime = audioCtx.currentTime;
+    } else {
+      phaseStartTime = 0;
+    }
+
+    running = false;
+    statusEl.textContent = "停止中";
+    log("RESET");
+    updateUI();
+  }
+
+  // ============================================================
+  // 12. テスト用PCキーボード
+  // ============================================================
+
+  const KEY_MAP = {
+    a: 60, w: 61, s: 62, e: 63, d: 64,
+    f: 65, t: 66, g: 67, y: 68, h: 69,
+    u: 70, j: 71, k: 72
+  };
+
+  const pressedKeys = new Set();
+
+  function makeKeyboardUI() {
+    Object.entries(KEY_MAP).forEach(([key, note]) => {
+      const btn = document.createElement("button");
+      btn.className = "key";
+      btn.textContent = `${key.toUpperCase()}\n${note}`;
+
+      btn.addEventListener("pointerdown", e => {
+        e.preventDefault();
+        handleNoteOn(note, 100, "screen");
+      });
+
+      const off = e => {
+        e.preventDefault();
+        handleNoteOff(note);
+      };
+
+      btn.addEventListener("pointerup", off);
+      btn.addEventListener("pointercancel", off);
+      btn.addEventListener("pointerleave", e => {
+        if (e.buttons) off(e);
+      });
+
+      kbdEl.appendChild(btn);
+    });
+  }
+
+  window.addEventListener("keydown", e => {
+    if (e.repeat) return;
+    const key = e.key.toLowerCase();
+    if (!(key in KEY_MAP)) return;
+    if (pressedKeys.has(key)) return;
+
+    pressedKeys.add(key);
+    handleNoteOn(KEY_MAP[key], 100, "keyboard");
+  });
+
+  window.addEventListener("keyup", e => {
+    const key = e.key.toLowerCase();
+    if (!(key in KEY_MAP)) return;
+
+    pressedKeys.delete(key);
+    handleNoteOff(KEY_MAP[key]);
+  });
+
+  // ============================================================
+  // 13. UIイベント
+  // ============================================================
+
+  startBtn.addEventListener("click", async () => {
+    await ensureAudio();
+
+    if (!midiAccess) {
+      await initMidi();
+    }
+
+    running = true;
+    phaseStartTime = audioCtx.currentTime;
+
+    statusEl.textContent = `実行中: PHASE ${currentPhase().name}`;
+    log("START");
+    updateUI();
+  });
+
+  resetBtn.addEventListener("click", () => {
+    resetSystem();
+  });
+
+  midiSelect.addEventListener("change", () => {
+    selectMidiInput(midiSelect.value);
+  });
+
+  // ============================================================
+  // 起動時
+  // ============================================================
+
+  makeKeyboardUI();
+  updateUI();
+})();
+</script>
+</body>
+</html>
